@@ -1,0 +1,534 @@
+% dcs_downlink_live_demo.m
+% Integrated Downlink TX -> AWGN Channel -> RX live demo
+% Ready for Review 3 (prints transmitted & recovered message, shows plots)
+clc; close all; clear;
+disp('=== DCS: Downlink Live Demo (TX -> Channel -> RX) ===');
+%% ---------- PARAMETERS ----------
+msg = 'Earthquake Detected - Evacuate!';   % message to transmit
+M = 16;           % 16-QAM
+Nfft = 64;        % OFDM IFFT size
+cpLen = 16;       % cyclic prefix
+snr_dB = 20;      % channel SNR in dB
+playSound = false; % set true to play the TX waveform as audio (optional)
+%% ---------- Prepare message -> bits ----------
+msg_codes = double(msg);
+nbits_char = max(8, ceil(log2(max(msg_codes)+1))); % bits per character
+bits_matrix = de2bi(msg_codes, nbits_char, 'left-msb');
+bits_col = bits_matrix.'; bits_col = bits_col(:);
+%% ---------- Pad bits so that total bits is multiple of bitsPerSym ----------
+bitsPerSym = log2(M);
+L = lcm(nbits_char, bitsPerSym);
+padBits = mod(-length(bits_col), L);
+if padBits>0
+   bits_col = [bits_col; zeros(padBits,1)];
+end
+%% ---------- Map bits -> 16-QAM symbols ----------
+sym_bits = reshape(bits_col, bitsPerSym, []).';
+tx_symbol_indices = bi2de(sym_bits, 'left-msb');
+tx_symbols = qammod(tx_symbol_indices, M, 'UnitAveragePower', true);
+%% ---------- OFDM modulation ----------
+[tx_sig, tx_ifft, tx_ofdm] = helper_ofdm_tx(tx_symbols, Nfft, cpLen);
+%% Optional: play TX waveform (scaled)
+if playSound
+   try
+       fs = 8192;
+       sound(real(tx_sig)/max(abs(real(tx_sig))), fs);
+   catch
+       warning('Unable to play sound on this system.');
+   end
+end
+%% ---------- Channel ----------
+rx_sig = awgn(tx_sig, snr_dB, 'measured'); % Built-in AWGN
+%% ---------- RX: OFDM demod ----------
+rx_symbols = helper_ofdm_rx(rx_sig, Nfft, cpLen);
+% Trim to original symbol count
+rx_symbols = rx_symbols(1:length(tx_symbols));
+%% ---------- QAM demodulation -> bits ----------
+rx_symbol_indices = qamdemod(rx_symbols, M, 'UnitAveragePower', true);
+rx_sym_bits = de2bi(rx_symbol_indices, log2(M), 'left-msb').';
+rx_bits_col = rx_sym_bits(:);
+% Remove padding
+if padBits>0
+   rx_bits_col = rx_bits_col(1:end-padBits);
+end
+% Keep only full characters
+usableBits = floor(length(rx_bits_col)/nbits_char) * nbits_char;
+rx_bits_col = rx_bits_col(1:usableBits);
+if ~isempty(rx_bits_col)
+   rx_chars_mat = reshape(rx_bits_col, nbits_char, []).';
+   rx_msg = char(bi2de(rx_chars_mat,'left-msb')).';
+else
+   rx_msg = '';
+end
+%% ---------- Display textual results ----------
+fprintf('\n--- Transmitted Message ---\n%s\n', msg);
+fprintf('\n--- Recovered Message ---\n%s\n', rx_msg);
+%% ---------- Visualization ----------
+% 1) TX / RX constellation overlay
+figure('Name','TX vs RX Constellation','NumberTitle','off');
+scatter(real(tx_symbols), imag(tx_symbols), 36, 'b','filled'); hold on;
+scatter(real(rx_symbols), imag(rx_symbols), 36, 'r');
+axis equal; grid on;
+title('TX (blue) vs RX (red) 16-QAM Constellation');
+xlabel('In-phase'); ylabel('Quadrature'); legend('TX','RX');
+% 2) OFDM time domain (first few samples)
+figure('Name','OFDM Time Domain (TX)','NumberTitle','off');
+Lplot = min(600, length(tx_sig));
+plot((1:Lplot), real(tx_sig(1:Lplot))); hold on;
+plot((1:Lplot), imag(tx_sig(1:Lplot))); hold off;
+title('Transmitted OFDM Signal (first samples)');
+legend('Real','Imag'); xlabel('Sample'); ylabel('Amplitude');
+% 3) Received signal (first samples)
+figure('Name','Received Time Domain','NumberTitle','off');
+Lplot = min(600, length(rx_sig));
+plot((1:Lplot), real(rx_sig(1:Lplot))); hold on;
+plot((1:Lplot), imag(rx_sig(1:Lplot))); hold off;
+title(sprintf('Received Signal (SNR=%d dB)', snr_dB));
+legend('Real','Imag'); xlabel('Sample'); ylabel('Amplitude');
+% 4) FFT magnitude of first OFDM symbol (RX)
+numCols = floor(length(rx_sig)/(Nfft+cpLen));
+if numCols>0
+   rx_matrix = reshape(rx_sig(1:(Nfft+cpLen)*numCols), Nfft+cpLen, numCols);
+   rx_noCP = rx_matrix(cpLen+1:end, :);
+   firstFFT = fft(rx_noCP(:,1));
+   figure('Name','RX FFT Magnitude (first OFDM symbol)','NumberTitle','off');
+   stem(0:Nfft-1, abs(firstFFT), 'filled');
+   title('RX: FFT Magnitude (first OFDM symbol)'); xlabel('Subcarrier Index'); ylabel('|X|');
+end
+disp('=== Demo complete ===');
+%helper_ofdm_tx.m
+function [tx_sig, tx_ifft, tx_with_cp] = helper_ofdm_tx(mod_symbols, Nfft, cpLen)
+% helper_ofdm_tx : Perform OFDM modulation with cyclic prefix
+% Inputs:
+%   mod_symbols : column vector of frequency-domain symbols (complex)
+%   Nfft        : FFT size (subcarriers)
+%   cpLen       : cyclic prefix length
+% Outputs:
+%   tx_sig      : serialized transmit signal (with CP)
+%   tx_ifft     : IFFT output (no CP) as [Nfft x numSymbols]
+%   tx_with_cp  : IFFT output with CP as [Nfft+cpLen x numSymbols]
+   if nargin < 3
+       error('Usage: helper_ofdm_tx(mod_symbols, Nfft, cpLen)');
+   end
+   mod_symbols = mod_symbols(:);
+   numSymbols = ceil(length(mod_symbols) / Nfft);
+   pad_len = numSymbols * Nfft - length(mod_symbols);
+   mod_symbols_padded = [mod_symbols; zeros(pad_len,1)];
+   mod_matrix = reshape(mod_symbols_padded, Nfft, numSymbols);
+   % IFFT per column
+   tx_ifft = ifft(mod_matrix, Nfft, 1);
+   % Add cyclic prefix
+   cp = tx_ifft(end-cpLen+1:end, :);
+   tx_with_cp = [cp; tx_ifft];
+   % Serialize
+   tx_sig = tx_with_cp(:);
+end
+ 
+%helper_ofdm_rx.m
+function rx_symbols = helper_ofdm_rx(rx_sig, Nfft, cpLen)
+% helper_ofdm_rx : Remove CP and perform FFT to get frequency-domain symbols
+% Inputs:
+%   rx_sig : received time-domain signal (with CP)
+%   Nfft   : FFT size (subcarriers)
+%   cpLen  : cyclic prefix length
+% Output:
+%   rx_symbols : column vector of frequency-domain symbols (complex)
+   if nargin < 3
+       error('Usage: helper_ofdm_rx(rx_sig, Nfft, cpLen)');
+   end
+   rx_sig = rx_sig(:);
+   numCols = floor(length(rx_sig) / (Nfft + cpLen));
+   if numCols == 0
+       rx_symbols = [];
+       return;
+   end
+   rx_matrix = reshape(rx_sig(1:numCols*(Nfft+cpLen)), Nfft+cpLen, numCols);
+   rx_no_cp = rx_matrix(cpLen+1:end, :);
+   rx_fft = fft(rx_no_cp, Nfft, 1);
+   rx_symbols = rx_fft(:);
+end
+ 
+% main_mimo_ofdm.m
+function main_mimo_ofdm
+% main_mimo_ofdm.m
+% 2x2 MIMO-OFDM using Alamouti STBC. Plots BER vs SNR.
+clc; clear; close all;
+disp('=== main_mimo_ofdm: 2x2 MIMO-OFDM (Alamouti) ===');
+%% Parameters
+Nfft = 64;
+cpLen = 16;
+M = 4;                  % QPSK
+numBlocks = 2000;       % number of Alamouti blocks (increase for smoother BER curve)
+SNRs = 0:2:20;
+rng(0); % seed for reproducibility
+BER = zeros(length(SNRs),1);
+for si = 1:length(SNRs)
+   snr_dB = SNRs(si);
+   numErr = 0;
+   totalBits = 0;
+   for blk = 1:numBlocks
+       % Generate two QPSK symbols (per Alamouti block)
+       bits_block = randi([0 1], 2*log2(M),1);
+       sym_block = qammod(bits_block, M, 'InputType','bit','UnitAveragePower',true);
+       s1 = sym_block(1);
+       s2 = sym_block(2);
+       % Alamouti encoding: two time slots for each transmit antenna
+       % Create frequency-domain OFDM symbol (place s1/s2 on first two subcarriers)
+       X1 = zeros(Nfft,1); X2 = zeros(Nfft,1);
+       X1(1) = s1; X1(2) = -conj(s2);
+       X2(1) = s2; X2(2) = conj(s1);
+       % IFFT to time domain
+       x1_ifft = ifft(X1,Nfft);
+       x2_ifft = ifft(X2,Nfft);
+       % Add CP
+       tx1 = [x1_ifft(end-cpLen+1:end); x1_ifft];
+       tx2 = [x2_ifft(end-cpLen+1:end); x2_ifft];
+       % Flat-fading 2x2 MIMO channel (complex Gaussian)
+       H11 = (randn+1i*randn)/sqrt(2);
+       H12 = (randn+1i*randn)/sqrt(2);
+       H21 = (randn+1i*randn)/sqrt(2);
+       H22 = (randn+1i*randn)/sqrt(2);
+       % AWGN
+       snrLin = 10^(snr_dB/10);
+       noiseVar = 1/(2*snrLin);
+       n1 = sqrt(noiseVar)*(randn(size(tx1)) + 1i*randn(size(tx1)));
+       n2 = sqrt(noiseVar)*(randn(size(tx2)) + 1i*randn(size(tx2)));
+       % Received signals (time domain)
+       r1 = H11*tx1 + H12*tx2 + n1;
+       r2 = H21*tx1 + H22*tx2 + n2;
+       % Remove CP and FFT
+       r1_noCP = r1(cpLen+1:end);
+       r2_noCP = r2(cpLen+1:end);
+       R1 = fft(r1_noCP, Nfft);
+       R2 = fft(r2_noCP, Nfft);
+       % Alamouti decoding for subcarrier 1 and 2 (we only used 2 subcarriers)
+       % For subcarrier 1:
+       y1 = [R1(1); R2(1)];
+       H_sub1 = [H11 H12; H21 H22];
+       % Apply Alamouti combining (ZF/ML simplified)
+       s1_hat = conj(H11)*R1(1) + H21*conj(R2(1));
+       s2_hat = conj(H12)*R1(1) + H22*conj(R2(1));
+       normFactor = abs(H11)^2 + abs(H12)^2 + abs(H21)^2 + abs(H22)^2 + eps;
+       s1_hat = s1_hat / normFactor;
+       s2_hat = s2_hat / normFactor;
+       % Decision via QPSK demod
+       rx_bits = qamdemod([s1_hat; s2_hat], M, 'OutputType','bit','UnitAveragePower',true);
+       numErr = numErr + sum(rx_bits ~= bits_block);
+       totalBits = totalBits + length(bits_block);
+   end
+   BER(si) = numErr / totalBits;
+   fprintf('SNR=%2d dB -> BER=%.3e\n', snr_dB, BER(si));
+end
+% Plot BER
+figure;
+semilogy(SNRs, BER, '-o','LineWidth',2);
+grid on; xlabel('SNR (dB)'); ylabel('Bit Error Rate (BER)');
+title('BER vs SNR for 2x2 MIMO-OFDM with Alamouti STBC');
+ 
+%Comparison_methods.m
+function comparison_methods
+% comparison_methods.m
+% Comparison of QPSK-OFDM, 16-QAM-OFDM, OTFS (BPSK), and 2x2 MIMO (Alamouti)
+clc; clear; close all;
+disp('=== BER Comparison: QPSK / 16-QAM / OTFS / 2x2 MIMO ===');
+rng(1);
+SNRs = 0:2:20;
+numBits = 4096;
+% Parameters
+Nfft = 64; cpLen = 16;
+M_QPSK = 4; M_QAM = 16;
+N_OTFS = 16;   % OTFS grid size
+numBlocks_MIMO = 512;
+BER_QPSK = zeros(size(SNRs));
+BER_QAM  = zeros(size(SNRs));
+BER_OTFS = zeros(size(SNRs));
+BER_MIMO = zeros(size(SNRs));
+for idx = 1:length(SNRs)
+   snr = SNRs(idx);
+   % --- QPSK-OFDM ---
+   bits_qpsk = randi([0 1], numBits,1);
+   tx_qpsk = qammod(bits_qpsk, M_QPSK, 'InputType','bit','UnitAveragePower',true);
+   tx_qpsk_ofdm = ofdmMod(tx_qpsk,Nfft,cpLen);
+   rx_qpsk_ofdm = awgn(tx_qpsk_ofdm, snr, 'measured');
+   rx_qpsk = ofdmDemod(rx_qpsk_ofdm,Nfft,cpLen);
+   rxBits_QPSK = qamdemod(rx_qpsk, M_QPSK, 'OutputType','bit','UnitAveragePower',true);
+   BER_QPSK(idx) = sum(bits_qpsk ~= rxBits_QPSK(1:length(bits_qpsk))) / length(bits_qpsk);
+   % --- 16-QAM-OFDM ---
+   bits_qam = randi([0 1], numBits,1);
+   tx_qam = qammod(bits_qam, M_QAM, 'InputType','bit','UnitAveragePower',true);
+   tx_qam_ofdm = ofdmMod(tx_qam,Nfft,cpLen);
+   rx_qam_ofdm = awgn(tx_qam_ofdm, snr, 'measured');
+   rx_qam = ofdmDemod(rx_qam_ofdm,Nfft,cpLen);
+   rxBits_QAM = qamdemod(rx_qam, M_QAM, 'OutputType','bit','UnitAveragePower',true);
+   BER_QAM(idx) = sum(bits_qam ~= rxBits_QAM(1:length(bits_qam))) / length(bits_qam);
+   % --- OTFS ---
+   otfsBits = randi([0 1], N_OTFS^2, 1);
+   tx_otfs = otfsMod(otfsBits, N_OTFS);
+   rx_otfs = awgnChannel(tx_otfs, snr);
+   rxBits_otfs = otfsDemod(rx_otfs, N_OTFS);
+   BER_OTFS(idx) = sum(otfsBits ~= rxBits_otfs) / length(otfsBits);
+   % --- MIMO ---
+   txMIMO = randi([0 1], 2*numBlocks_MIMO, 1);
+   rxMIMO_bits = alamoutiMimo(txMIMO, snr);
+   BER_MIMO(idx) = sum(txMIMO ~= rxMIMO_bits) / length(txMIMO);
+end
+% Plot
+figure;
+semilogy(SNRs,BER_QPSK,'-o','LineWidth',2); hold on;
+semilogy(SNRs,BER_QAM,'-s','LineWidth',2);
+semilogy(SNRs,BER_OTFS,'-^','LineWidth',2);
+semilogy(SNRs,BER_MIMO,'-d','LineWidth',2);
+grid on;
+xlabel('SNR (dB)'); ylabel('Bit Error Rate (BER)');
+title('BER Comparison: QPSK / 16-QAM / OTFS / 2x2 MIMO');
+legend('QPSK-OFDM','16-QAM-OFDM','OTFS (BPSK)','2x2 MIMO','Location','southwest');
+end  % <---- Important: close the main function here
+% ---------- Helper Functions Below ----------
+function ofdmSig = ofdmMod(symbols,Nfft,cpLen)
+   symbols = symbols(:);
+   numSymbols = length(symbols);
+   numOFDM = ceil(numSymbols/Nfft);
+   symbolsPad = [symbols; zeros(numOFDM*Nfft - numSymbols,1)];
+   X = reshape(symbolsPad,Nfft,numOFDM);
+   x_ifft = ifft(X,Nfft,1);
+   ofdmMat = [x_ifft(end-cpLen+1:end,:); x_ifft];
+   ofdmSig = ofdmMat(:);
+end
+function rxSymbols = ofdmDemod(rxSig,Nfft,cpLen)
+   numOFDM = floor(length(rxSig)/(Nfft+cpLen));
+   if numOFDM==0
+       rxSymbols = [];
+       return;
+   end
+   rxMat = reshape(rxSig(1:(Nfft+cpLen)*numOFDM),Nfft+cpLen,numOFDM);
+   rxNoCP = rxMat(cpLen+1:end,:);
+   X = fft(rxNoCP,Nfft,1);
+   rxSymbols = X(:);
+end
+ 
+%AlamoutiMimo.m
+function rxBits = alamoutiMimo(txBits, SNRdB)
+% alamoutiMimo: simplified 2x2 Alamouti MIMO simulation for BPSK bits
+% txBits : column vector (length must be even)
+% returns rxBits : decoded bits (same length as txBits)
+   if mod(length(txBits),2) ~= 0
+       txBits = [txBits; 0];
+   end
+   numBlocks = length(txBits)/2;
+   % BPSK mapping
+   s = 2*txBits - 1;
+   s1 = s(1:2:end).';
+   s2 = s(2:2:end).';
+   H11 = (randn(1,numBlocks)+1i*randn(1,numBlocks))/sqrt(2);
+   H12 = (randn(1,numBlocks)+1i*randn(1,numBlocks))/sqrt(2);
+   H21 = (randn(1,numBlocks)+1i*randn(1,numBlocks))/sqrt(2);
+   H22 = (randn(1,numBlocks)+1i*randn(1,numBlocks))/sqrt(2);
+   snrLin = 10^(SNRdB/10);
+   noiseVar = 1/(2*snrLin);
+   n1 = sqrt(noiseVar)*(randn(1,numBlocks)+1i*randn(1,numBlocks));
+   n2 = sqrt(noiseVar)*(randn(1,numBlocks)+1i*randn(1,numBlocks));
+   r1 = H11.*s1 + H12.*s2 + n1;
+   r2 = H21.*s1 + H22.*s2 + n2;
+   s1_hat = conj(H11).*r1 + H21.*conj(r2);
+   s2_hat = conj(H12).*r1 + H22.*conj(r2);
+   % Decision (BPSK)
+   s1_bits = real(s1_hat) > 0;
+   s2_bits = real(s2_hat) > 0;
+   rxBits = zeros(length(txBits),1);
+   rxBits(1:2:end) = s1_bits.';
+   rxBits(2:2:end) = s2_bits.';
+end
+ 
+% dcs_gui_demo.m
+% =========================================
+% GUI + Live SNR Control for DCS Project
+% Combines all your existing scripts interactively.
+% =========================================
+function dcs_gui_demo
+   % Create GUI window
+   fig = uifigure('Name','DCS Live Demo','Position',[400 200 500 400]);
+   % Title label
+   uilabel(fig, 'Text', 'Digital Communication System - Live Demo', ...
+       'FontSize', 16, 'FontWeight','bold', 'Position',[50 340 400 30]);
+   % SNR slider label
+   uilabel(fig, 'Text', 'Channel SNR (dB):', ...
+       'FontSize', 13, 'Position',[80 270 120 30]);
+   % SNR slider (5–30 dB)
+   sld = uislider(fig, 'Position',[210 285 200 3], ...
+       'Limits',[5 30], 'Value',20, ...
+       'MajorTicks',5:5:30, 'ValueChangedFcn',@(sld,event)updateSNR(sld));
+   % Display SNR value
+   snrLabel = uilabel(fig, 'Text','20 dB','FontSize',13,'Position',[420 270 60 30]);
+   % Buttons
+   uibutton(fig,'Text','Run Downlink Demo','FontSize',13,...
+       'Position',[150 200 200 40],...
+       'ButtonPushedFcn',@(btn,event)runDownlink(sld));
+   uibutton(fig,'Text','Run MIMO-OFDM','FontSize',13,...
+       'Position',[150 140 200 40],...
+       'ButtonPushedFcn',@(btn,event)runMIMO);
+   uibutton(fig,'Text','Compare Methods','FontSize',13,...
+       'Position',[150 80 200 40],...
+       'ButtonPushedFcn',@(btn,event)runCompare);
+   uibutton(fig,'Text','Exit','FontSize',13,...
+       'Position',[150 20 200 40],...
+       'ButtonPushedFcn',@(btn,event)close(fig));
+   % --- Nested functions for callbacks ---
+   function updateSNR(sld)
+       snrVal = round(sld.Value);
+       snrLabel.Text = sprintf('%d dB', snrVal);
+   end
+   function runDownlink(sld)
+       snrVal = round(sld.Value);
+       fprintf('\n>>> Running Downlink Demo at %d dB SNR...\n', snrVal);
+       dcs_downlink_live_demo_customSNR(snrVal);
+   end
+   function runMIMO(~)
+       fprintf('\n>>> Running MIMO-OFDM Simulation...\n');
+       main_mimo_ofdm;
+   end
+   function runCompare(~)
+       fprintf('\n>>> Running BER Comparison...\n');
+       evalin('base','comparison_methods');
+   end
+end
+ 
+%dcs_downlink_live_demo_customSNR.m
+function dcs_downlink_live_demo_customSNR(snr_dB)
+% ===============================================================
+% Digital Communication System: Downlink Demo (Adjustable SNR)
+% Integrated TX/RX visualization for GUI
+% ===============================================================
+clc; close all;
+% --- System Parameters ---
+msg = 'Earthquake Detected - Evacuate!';
+M = 16;                % 16-QAM
+Nfft = 64;             % OFDM FFT size
+cpLen = 16;            % Cyclic prefix length
+% --- Convert message to bits ---
+msg_codes = double(msg);
+nbits_char = max(8, ceil(log2(max(msg_codes)+1)));
+bits_matrix = de2bi(msg_codes, nbits_char, 'left-msb');
+bits_col = bits_matrix.'; bits_col = bits_col(:);
+bitsPerSym = log2(M);
+L = lcm(nbits_char, bitsPerSym);
+padBits = mod(-length(bits_col), L);
+if padBits > 0, bits_col = [bits_col; zeros(padBits,1)]; end
+sym_bits = reshape(bits_col, bitsPerSym, []).';
+tx_symbols = qammod(bi2de(sym_bits,'left-msb'), M, 'UnitAveragePower', true);
+% --- OFDM Transmitter ---
+[tx_sig, ~, ~] = helper_ofdm_tx(tx_symbols, Nfft, cpLen);
+% --- Channel: AWGN ---
+rx_sig = awgn(tx_sig, snr_dB, 'measured');
+% --- OFDM Receiver ---
+rx_symbols = helper_ofdm_rx(rx_sig, Nfft, cpLen);
+rx_symbols = rx_symbols(1:length(tx_symbols));
+% --- QAM Demodulation ---
+rx_bits = de2bi(qamdemod(rx_symbols,M,'UnitAveragePower',true), log2(M), 'left-msb').';
+rx_bits = rx_bits(:);
+if padBits > 0, rx_bits = rx_bits(1:end-padBits); end
+usableBits = floor(length(rx_bits)/nbits_char)*nbits_char;
+rx_bits = rx_bits(1:usableBits);
+rx_chars = reshape(rx_bits, nbits_char, []).';
+rx_msg = char(bi2de(rx_chars,'left-msb')).';
+% --- Print to console (optional) ---
+fprintf('\n--- TX Message ---\n%s\n', msg);
+fprintf('\n--- RX Message ---\n%s\n', rx_msg);
+% ===============================================================
+%           COMBINED 4-IN-1 VISUALIZATION WINDOW
+% ===============================================================
+figure('Name', sprintf('DCS Downlink Demo (SNR = %d dB)', snr_dB), ...
+      'Position', [200 100 1000 700]);
+% ===============================================================
+%           COMBINED 4-IN-1 VISUALIZATION WINDOW
+% ===============================================================
+figure('Name', sprintf('DCS Downlink Demo (SNR = %d dB)', snr_dB), ...
+      'Position', [200 100 1000 700]);
+% 1️⃣ Transmitted OFDM signal
+subplot(2,2,1);
+Nplot = min(length(tx_sig), 200);
+plot(real(tx_sig(1:Nplot)),'b'); hold on;
+plot(imag(tx_sig(1:Nplot)),'r');
+title('Transmitted Signal (first samples)');
+xlabel('Sample Index'); ylabel('Amplitude');
+legend('Real','Imag'); grid on;
+% 2️⃣ Received signal with noise
+subplot(2,2,2);
+Nplot = min(length(rx_sig), 200);
+plot(real(rx_sig(1:Nplot)),'b'); hold on;
+plot(imag(rx_sig(1:Nplot)),'r');
+title(sprintf('Received Signal (SNR = %d dB)', snr_dB));
+xlabel('Sample Index'); ylabel('Amplitude');
+legend('Real','Imag'); grid on;
+% 3️⃣ Frequency-domain magnitude (FFT)
+subplot(2,2,3);
+rx_fft = fft(rx_sig(1:min(length(rx_sig), Nfft)));
+stem(abs(rx_fft),'filled');
+title('RX FFT Magnitude (first OFDM symbol)');
+xlabel('Subcarrier Index'); ylabel('|Amplitude|');
+grid on;
+% 4️⃣ Constellation: TX vs RX
+subplot(2,2,4);
+scatter(real(tx_symbols), imag(tx_symbols), 25, 'b', 'filled'); hold on;
+scatter(real(rx_symbols), imag(rx_symbols), 25, 'r');
+axis equal; grid on;
+title(sprintf('TX (blue) vs RX (red) 16-QAM Constellation\nSNR = %d dB', snr_dB));
+xlabel('In-phase'); ylabel('Quadrature');
+legend('TX','RX','Location','best');
+% ===============================================================
+%                 MESSAGE BOX SUMMARY
+% ===============================================================
+msgbox({['SNR = ' num2str(snr_dB) ' dB'], ...
+       ['Transmitted Message:  ' msg], ...
+       ['Recovered Message:    ' rx_msg]}, ...
+       'Transmission Result');
+end
+ 
+% otfs_helpers.m
+% Simple helper functions for OTFS modulation/demodulation and AWGN
+function txSig = otfsMod(bits, N)
+% txSig = otfsMod(bits,N)
+% Performs a lightweight OTFS-like modulation for demonstration.
+   bits = bits(:);
+   symbols = 2*bits - 1;           % BPSK mapping
+   grid = reshape(symbols, N, N);  % Fill N×N grid
+   % 2-D symplectic transform (simplified)
+   txGrid = ifft(fft(grid,[],1),[],2);
+   txSig = txGrid(:);              % Serialize
+end
+function rxBits = otfsDemod(rxSig, N)
+% rxBits = otfsDemod(rxSig,N)
+% Inverse operation of otfsMod.
+   grid = reshape(rxSig, N, N);
+   X_hat = fft(ifft(grid,[],1),[],2);
+   rxBits = real(X_hat(:)) > 0;    % Hard-decision BPSK
+end
+function rxSig = awgnChannel(txSig, SNRdB)
+% rxSig = awgnChannel(txSig,SNRdB)
+% Adds complex AWGN noise at specified SNR.
+   snrLin = 10^(SNRdB/10);
+   noiseVar = 1/(2*snrLin);
+   noise = sqrt(noiseVar) * (randn(size(txSig)) + 1i*randn(size(txSig)));
+   rxSig = txSig + noise;
+end
+ 
+%otfsDemod.m
+function rxBits = otfsDemod(rxSig, N)
+% rxBits = otfsDemod(rxSig, N)
+% Simplified OTFS-like demodulation for BER comparison demo
+   % Reshape received vector back into N×N grid
+   grid = reshape(rxSig, N, N);
+   % Apply inverse transform (approximation of OTFS detection)
+   X_hat = fft(ifft(grid, [], 1), [], 2);
+   % Hard decision BPSK detection
+   rxBits = real(X_hat(:)) > 0;
+end 
+%awgnChannel.m
+function rxSig = awgnChannel(txSig, SNRdB)
+% rxSig = awgnChannel(txSig,SNRdB)
+% Adds complex AWGN noise at specified SNR (for OTFS demo)
+   snrLin = 10^(SNRdB/10);
+   noiseVar = 1/(2*snrLin);
+   noise = sqrt(noiseVar)*(randn(size(txSig)) + 1i*randn(size(txSig)));
+   rxSig = txSig + noise;
+end
+
